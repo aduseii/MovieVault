@@ -19,6 +19,18 @@ Watches your **Downloads** folder and moves every movie and TV episode into one 
 - Small clips are ignored: episodes under 40 MB and movies under 300 MB stay put (change in Settings).
   A video also needs a movie/TV-style name (year, SxxEyy, 1080p, WEB-DL…), so your own clips stay in Downloads.
 
+## English names
+Shows and movies named in another language get their English name, e.g. `O Estúdio` → `The Studio`,
+`Batman - Cruzado Encapuzado` → `Batman - Caped Crusader`. Names are looked up on Wikidata (free, no account)
+and only changed when the name exactly matches one of that show's or movie's official names.
+Folders already in the vault are renamed too. Turn it off in Settings.
+
+## The rest of your PC
+Every 6 hours (and from **Scan whole PC**) Movie Vault looks through all your drives for movies and shows
+outside Downloads. Those files stay where they are; a **shortcut** to each one is added to the vault, so
+everything shows up in one place. Windows, Program Files, AppData and game folders (Steam, Epic, Xbox, Riot)
+are skipped. If you delete the original file, its shortcut is removed from the vault. Turn it off in Settings.
+
 ## Updates
 Movie Vault updates itself from this GitHub repo: it checks 15 seconds after starting and then
 every 3 hours, installs the new version and restarts. **Check for updates** (window or tray menu)

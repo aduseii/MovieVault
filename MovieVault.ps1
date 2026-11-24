@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $App          = 'Movie Vault'
-$Version      = '1.2.0'      # bump this on every change pushed to GitHub - installed copies update themselves
+$Version      = '1.3.0'      # bump this on every change pushed to GitHub - installed copies update themselves
 $UpdateUrl    = 'https://raw.githubusercontent.com/aduseii/MovieVault/main/MovieVault.ps1'
 $DataDir      = Join-Path $env:APPDATA 'MovieVault'
 if (-not (Test-Path -LiteralPath $DataDir)) { [void][IO.Directory]::CreateDirectory($DataDir) }
@@ -76,6 +76,8 @@ function Load-Settings {
         TelegramToken    = ''
         TelegramChatId   = ''
         ProtectedParent  = ''
+        Translate        = $true
+        ScanWholePC      = $true
     }
     if (Test-Path -LiteralPath $SettingsFile) {
         try {
@@ -283,7 +285,15 @@ function Get-MediaInfo([IO.FileInfo]$f) {
     if ($m) {
         if (-not $title -and $parentName) {
             $pm = Match-TV $parentName $true
-            if ($pm) { $title = Clean-Title $pm.Groups['t'].Value } else { $title = Clean-Title $parentName }
+            if ($pm) { $title = Clean-Title $pm.Groups['t'].Value }
+            elseif ($parentName -notmatch '(?i)^(season|series|s)\s*\d+$') { $title = Clean-Title $parentName }
+        }
+        if (-not $title) {
+            # e.g. D:\Shows\The Office\Season 2\03.mkv -> use the folder above "Season 2"
+            $gp = $f.Directory.Parent
+            if ($gp -and $gp.Parent -and -not ($gp.FullName.TrimEnd('\') -ieq $script:S.DownloadsPath.TrimEnd('\'))) {
+                $title = Clean-Title $gp.Name
+            }
         }
         if (-not $title) { $title = 'Unknown Show' }
         if ($mb -lt $script:S.MinEpisodeMB) { return $null }
@@ -370,22 +380,148 @@ function Notify($moved) {
     else { $text = 'Added {0} items: {1}' -f $moved.Count, ((@($moved) | Select-Object -First 3 | ForEach-Object { $_.Title }) -join ', ') }
     try { $script:tray.ShowBalloonTip(5000, $App, $text, [System.Windows.Forms.ToolTipIcon]::Info) } catch {}
     $film = [char]::ConvertFromUtf32(0x1F3AC)
-    $lines = @($moved) | ForEach-Object {
+    $lines = @(@($moved) | Select-Object -First 15 | ForEach-Object {
         $where = 'Movies'; if ($_.Kind -eq 'TV') { $where = 'TV Shows' }
         '- {0}  ({1})' -f $_.Title, $where
-    }
+    })
+    if ($moved.Count -gt 15) { $lines += ('...and {0} more' -f ($moved.Count - 15)) }
     Send-Telegram ("$film Movie Vault`n" + ($lines -join "`n"))
 }
 
 # ---------------------------------------------------------------- scan + move
-function Move-Media([IO.FileInfo]$f, $info, [System.Collections.ArrayList]$moved) {
-    if ($info.Kind -eq 'TV') {
-        $dest = Join-Path (Join-Path (Join-Path $script:S.LibraryPath 'TV Shows') $info.Title) ('Season {0:D2}' -f [int]$info.Season)
-        $label = '{0} - Season {1}' -f $info.Title, $info.Season
-    } else {
-        $dest = Join-Path (Join-Path $script:S.LibraryPath 'Movies') $info.Title
-        $label = $info.Title
+# ---------------------------------------------------------------- English titles (Wikidata, no account needed)
+$WdUA      = "MovieVault/$Version (https://github.com/aduseii/MovieVault)"
+$TvTypes   = 'P31=Q5398426|P31=Q581714|P31=Q117467246|P31=Q1259759|P31=Q15416|P31=Q526877'
+$FilmTypes = 'P31=Q11424|P31=Q202866|P31=Q24862|P31=Q506240|P31=Q29168811'
+$TitleFile = Join-Path $DataDir 'titles.json'
+$script:TitleCache = @{}
+if (Test-Path -LiteralPath $TitleFile) {
+    try {
+        $j = Get-Content -LiteralPath $TitleFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($p in $j.PSObject.Properties) { $script:TitleCache[$p.Name] = [string]$p.Value }
+    } catch { Write-Log "titles: $_" }
+}
+
+function Normalize-Name([string]$s) {
+    if (-not $s) { return '' }
+    $d = $s.Normalize([Text.NormalizationForm]::FormD)
+    $sb = New-Object Text.StringBuilder
+    foreach ($ch in $d.ToCharArray()) {
+        if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -ne [Globalization.UnicodeCategory]::NonSpacingMark) { [void]$sb.Append($ch) }
     }
+    $t = $sb.ToString().ToLowerInvariant() -replace '&', ' and ' -replace '[^\p{L}\p{N}]+', ' '
+    return ($t -replace '\s+', ' ').Trim()
+}
+
+function Invoke-Wikidata([hashtable]$q) {
+    $qs = ($q.GetEnumerator() | ForEach-Object { [Uri]::EscapeDataString([string]$_.Key) + '=' + [Uri]::EscapeDataString([string]$_.Value) }) -join '&'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $req = [Net.HttpWebRequest]::Create("https://www.wikidata.org/w/api.php?$qs")
+    $req.UserAgent = $WdUA
+    $req.Timeout = 10000
+    $res = $req.GetResponse()
+    try {
+        $sr = New-Object IO.StreamReader($res.GetResponseStream(), [Text.Encoding]::UTF8)
+        return ($sr.ReadToEnd() | ConvertFrom-Json)
+    } finally { $res.Close() }
+}
+
+# Returns the English title for a show/movie name in another language, or the name unchanged.
+# Only translates when the name exactly matches one of the show's/movie's names on Wikidata.
+function Get-EnglishTitle([string]$title, [string]$kind) {
+    if (-not $script:S.Translate -or -not $title -or $title -eq 'Unknown Show') { return $title }
+    $key = "$kind|$title"
+    if ($script:TitleCache.ContainsKey($key)) { return $script:TitleCache[$key] }
+    $result = $title
+    try {
+        $query = $title; $year = ''
+        $ym = [regex]::Match($title, '^(?<t>.+?)\s*\(?(?<y>(19|20)\d{2})\)?$')
+        if ($ym.Success) { $query = $ym.Groups['t'].Value.Trim(' ', '-'); $year = $ym.Groups['y'].Value }
+        $types = $FilmTypes; if ($kind -eq 'TV') { $types = $TvTypes }
+
+        $r = Invoke-Wikidata @{ action = 'query'; list = 'search'; format = 'json'; srlimit = '6'; srsearch = "$query haswbstatement:$types" }
+        $ids = @($r.query.search | ForEach-Object { $_.title })
+        if ($ids.Count -gt 0) {
+            $e = Invoke-Wikidata @{ action = 'wbgetentities'; format = 'json'; ids = ($ids -join '|'); props = 'labels|aliases|descriptions' }
+            $nq = Normalize-Name $query
+            $already = $false; $pick = $null
+            foreach ($id in $ids) {
+                $ent = $e.entities.$id
+                if (-not $ent) { continue }
+                $en = ''; if ($ent.labels.en) { $en = [string]$ent.labels.en.value }
+                if (-not $en) { continue }
+                $enNames = @($en)
+                if ($ent.aliases.en) { foreach ($a in $ent.aliases.en) { $enNames += [string]$a.value } }
+                if (@($enNames | Where-Object { (Normalize-Name $_) -eq $nq }).Count -gt 0) { $already = $true; break }
+
+                $names = @()
+                foreach ($p in $ent.labels.PSObject.Properties) { $names += [string]$p.Value.value }
+                foreach ($p in $ent.aliases.PSObject.Properties) { foreach ($a in $p.Value) { $names += [string]$a.value } }
+                if (@($names | Where-Object { (Normalize-Name $_) -eq $nq }).Count -eq 0) { continue }
+
+                $desc = ''; if ($ent.descriptions.en) { $desc = [string]$ent.descriptions.en.value }
+                if (-not $pick) { $pick = $en }
+                if ($year -and $desc -match $year) { $pick = $en; break }
+            }
+            if ($pick -and -not $already) {
+                $clean = Clean-Title ($pick -replace '\s*:\s*', ' - ')
+                if ($clean -and (Normalize-Name $clean) -ne $nq) {
+                    $result = $clean
+                    if ($year) { $result = '{0} ({1})' -f $clean, $year }
+                }
+            }
+        }
+        $script:TitleCache[$key] = $result
+        try { $script:TitleCache | ConvertTo-Json | Set-Content -LiteralPath $TitleFile -Encoding UTF8 } catch {}
+        if ($result -ne $title) { Write-Log "translated '$title' -> '$result'" }
+    } catch {
+        Write-Log "translate '$title': $_"    # not cached, tried again next time
+    }
+    return $result
+}
+
+function Get-DestFolder($info) {
+    $title = Get-EnglishTitle $info.Title $info.Kind
+    if ($info.Kind -eq 'TV') {
+        return [pscustomobject]@{
+            Dir   = Join-Path (Join-Path (Join-Path $script:S.LibraryPath 'TV Shows') $title) ('Season {0:D2}' -f [int]$info.Season)
+            Label = '{0} - Season {1}' -f $title, $info.Season }
+    }
+    return [pscustomobject]@{ Dir = Join-Path (Join-Path $script:S.LibraryPath 'Movies') $title; Label = $title }
+}
+
+# Moves everything from one folder into another (used when a folder gets its English name).
+function Merge-Dir([string]$src, [string]$dst) {
+    if ($src.TrimEnd('\') -ieq $dst.TrimEnd('\')) {
+        if ($src -cne $dst) { [IO.Directory]::Move($src, "$src.tmp~"); [IO.Directory]::Move("$src.tmp~", $dst) }   # case-only rename
+        return
+    }
+    if (-not [IO.Directory]::Exists($dst)) { [IO.Directory]::Move($src, $dst); return }
+    foreach ($d in @(Get-ChildItem -LiteralPath $src -Directory -Force)) { Merge-Dir $d.FullName (Join-Path $dst $d.Name) }
+    foreach ($fl in @(Get-ChildItem -LiteralPath $src -File -Force)) { [IO.File]::Move($fl.FullName, (Get-FreePath $dst $fl.Name)) }
+    if (@(Get-ChildItem -LiteralPath $src -Force).Count -eq 0) { [IO.Directory]::Delete($src) }
+}
+
+# Renames show/movie folders already in the vault to their English names (once per start).
+$script:TranslatedExisting = $false
+function Invoke-TranslateExisting {
+    if ($script:TranslatedExisting -or -not $script:S.Translate) { return }
+    $script:TranslatedExisting = $true
+    foreach ($cat in @(@{ Dir = 'TV Shows'; Kind = 'TV' }, @{ Dir = 'Movies'; Kind = 'Movie' })) {
+        $root = Join-Path $script:S.LibraryPath $cat.Dir
+        if (-not [IO.Directory]::Exists($root)) { continue }
+        foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+            try {
+                $en = Get-EnglishTitle $d.Name $cat.Kind
+                if ($en -and $en -ne $d.Name) { Merge-Dir $d.FullName (Join-Path $root $en) }
+            } catch { Write-Log "rename $($d.FullName): $_" }
+        }
+    }
+}
+
+function Move-Media([IO.FileInfo]$f, $info, [System.Collections.ArrayList]$moved) {
+    $df = Get-DestFolder $info
+    $dest = $df.Dir; $label = $df.Label
     [void][IO.Directory]::CreateDirectory($dest)
 
     $srcDir = $f.DirectoryName
@@ -434,6 +570,125 @@ function Invoke-Resort([System.Collections.ArrayList]$moved) {
     }
 }
 
+# ---------------------------------------------------------------- whole-PC scan -> shortcuts in the vault
+# Movies/shows found anywhere else on the PC stay where they are; a shortcut to each is put in the vault.
+$PcScanScript = {
+    param($roots, $skipPaths, $minBytes, $exts)
+    $skipNames = @('windows', 'program files', 'program files (x86)', 'programdata', 'appdata', '$recycle.bin',
+        'system volume information', 'recovery', 'perflogs', 'node_modules', 'steamapps', 'steamlibrary',
+        'epic games', 'xboxgames', 'riot games', 'windowsapps', '.git', 'msocache', 'config.msi',
+        '$windows.~bt', '$windows.~ws', '$sysreset', '$winreagent', 'onedrivetemp')
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    foreach ($r in $roots) { $stack.Push([string]$r) }
+    while ($stack.Count -gt 0) {
+        $d = $stack.Pop()
+        try {
+            foreach ($f in [IO.Directory]::EnumerateFiles($d)) {
+                if ($exts -contains [IO.Path]::GetExtension($f).ToLowerInvariant()) {
+                    try { if ((New-Object IO.FileInfo $f).Length -ge $minBytes) { $f } } catch {}
+                }
+            }
+            foreach ($sub in [IO.Directory]::EnumerateDirectories($d)) {
+                try {
+                    $di = New-Object IO.DirectoryInfo $sub
+                    if ($di.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                    if ($skipNames -contains $di.Name.ToLowerInvariant()) { continue }
+                    $full = $di.FullName.TrimEnd('\') + '\'
+                    $skip = $false
+                    foreach ($sp in $skipPaths) { if ($full.StartsWith([string]$sp, [StringComparison]::OrdinalIgnoreCase)) { $skip = $true; break } }
+                    if (-not $skip) { $stack.Push($sub) }
+                } catch {}
+            }
+        } catch {}
+    }
+}
+
+$script:PcJob = $null
+$script:NextPcScan = (Get-Date).AddSeconds(60)
+try { $script:Wsh = New-Object -ComObject WScript.Shell } catch { Write-Log "wscript: $_" }
+
+function Start-PcScan([bool]$manual = $false) {
+    if ($script:PcJob) {
+        if ($manual) { $script:tray.ShowBalloonTip(3000, $App, 'A PC scan is already running.', [System.Windows.Forms.ToolTipIcon]::Info) }
+        return
+    }
+    if (-not $script:S.ScanWholePC -and -not $manual) { return }
+    $roots = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq [IO.DriveType]::Fixed -and $_.IsReady } | ForEach-Object { $_.RootDirectory.FullName })
+    $skip = @(
+        ([IO.Path]::GetFullPath($script:S.LibraryPath).TrimEnd('\') + '\'),
+        ($script:S.DownloadsPath.TrimEnd('\') + '\'))
+    $min = [long][Math]::Min([int]$script:S.MinEpisodeMB, [int]$script:S.MinMovieMB) * 1MB
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($PcScanScript.ToString())
+    [void]$ps.AddArgument($roots).AddArgument($skip).AddArgument($min).AddArgument($VideoExt)
+    $script:PcJob = [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Manual = $manual }
+    if ($manual) { $script:tray.ShowBalloonTip(3000, $App, 'Scanning the whole PC in the background...', [System.Windows.Forms.ToolTipIcon]::Info) }
+}
+
+function Remove-EmptyUpTo([string]$dir) {
+    $stops = @((Join-Path $script:S.LibraryPath 'Movies').TrimEnd('\'), (Join-Path $script:S.LibraryPath 'TV Shows').TrimEnd('\'), $script:S.LibraryPath.TrimEnd('\'))
+    while ($dir -and [IO.Directory]::Exists($dir) -and -not ($stops -icontains $dir.TrimEnd('\'))) {
+        if (@(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue).Count -gt 0) { break }
+        try { [IO.Directory]::Delete($dir) } catch { break }
+        $dir = [IO.Path]::GetDirectoryName($dir)
+    }
+}
+
+# Shortcuts whose movie was deleted (and whose drive is still plugged in) are removed.
+function Remove-StaleShortcuts {
+    if (-not $script:Wsh) { return }
+    foreach ($l in @(Get-ChildItem -LiteralPath $script:S.LibraryPath -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue)) {
+        try {
+            $t = [string]$script:Wsh.CreateShortcut($l.FullName).TargetPath
+            if (-not $t -or ($VideoExt -notcontains [IO.Path]::GetExtension($t).ToLower())) { continue }
+            $root = [IO.Path]::GetPathRoot($t)
+            if ($root -and (Test-Path -LiteralPath $root) -and -not (Test-Path -LiteralPath $t)) {
+                Remove-Item -LiteralPath $l.FullName -Force
+                Remove-EmptyUpTo $l.DirectoryName
+            }
+        } catch {}
+    }
+}
+
+function Complete-PcScan {
+    $job = $script:PcJob
+    $script:PcJob = $null
+    $added = New-Object System.Collections.ArrayList
+    try {
+        $paths = @($job.PS.EndInvoke($job.Handle) | ForEach-Object { [string]$_ })
+        Remove-StaleShortcuts
+        foreach ($p in $paths) {
+            try {
+                $f = New-Object IO.FileInfo $p
+                if (-not $f.Exists) { continue }
+                $info = Get-MediaInfo $f
+                if (-not $info) { continue }
+                $df = Get-DestFolder $info
+                $lnk = Join-Path $df.Dir ([IO.Path]::GetFileNameWithoutExtension($f.Name) + '.lnk')
+                if (Test-Path -LiteralPath $lnk) { continue }    # already linked
+                [void][IO.Directory]::CreateDirectory($df.Dir)
+                $sc = $script:Wsh.CreateShortcut($lnk)
+                $sc.TargetPath = $f.FullName
+                $sc.WorkingDirectory = $f.DirectoryName
+                $sc.Save()
+                [void]$added.Add([pscustomobject]@{
+                    Time  = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+                    Kind  = $info.Kind
+                    Title = $df.Label + ' (shortcut)'
+                    File  = $f.FullName
+                    Path  = $f.FullName
+                })
+            } catch { Write-Log "shortcut $p : $_" }
+        }
+    } catch {
+        Write-Log "pc scan: $_"
+    } finally {
+        try { $job.PS.Dispose() } catch {}
+    }
+    if ($added.Count -gt 0) { Add-History $added; Notify $added }
+    elseif ($job.Manual) { $script:tray.ShowBalloonTip(3000, $App, 'PC scan done. No new movies or shows found.', [System.Windows.Forms.ToolTipIcon]::Info) }
+}
+
 $script:Busy = $false
 function Invoke-Scan([bool]$manual = $false) {
     if ($script:Busy) { return }
@@ -462,6 +717,7 @@ function Invoke-Scan([bool]$manual = $false) {
         }
 
         Invoke-Resort $moved
+        Invoke-TranslateExisting
     } catch {
         Write-Log "scan: $_"
     } finally {
@@ -526,6 +782,7 @@ function New-Button([string]$text) {
 $btnOpen     = New-Button 'Open vault folder'
 $btnScan     = New-Button 'Scan Downloads now'
 $btnSettings = New-Button 'Settings'
+$btnPc       = New-Button 'Scan whole PC'
 $btnUpdate   = New-Button 'Check for updates'
 $top.Controls.Add($buttons)
 
@@ -579,6 +836,7 @@ $list.Add_DoubleClick({
 })
 $btnOpen.Add_Click({ Open-Vault })
 $btnScan.Add_Click({ Invoke-Scan $true })
+$btnPc.Add_Click({ Start-PcScan $true })
 
 # ---------------------------------------------------------------- settings window
 function Show-Settings {
@@ -644,6 +902,8 @@ function Show-Settings {
     $nMov   = Add-Number 'Smallest movie (MB)' ([int]$script:S.MinMovieMB)
     $cbLock = Add-Check 'Lock the vault folder so it can''t be deleted from outside' ([bool]$script:S.Protect)
     $cbRun  = Add-Check 'Start Movie Vault when Windows starts' ([bool]$script:S.StartWithWindows)
+    $cbTr   = Add-Check 'Use English names for shows and movies in other languages' ([bool]$script:S.Translate)
+    $cbPc   = Add-Check 'Find movies and shows on the rest of the PC (adds shortcuts to the vault)' ([bool]$script:S.ScanWholePC)
     $tbTok  = Add-Text 'Telegram bot token (optional)' ([string]$script:S.TelegramToken)
     $tbChat = Add-Text 'Telegram chat ID' ([string]$script:S.TelegramChatId)
 
@@ -700,6 +960,9 @@ function Show-Settings {
     $script:S.MinMovieMB       = [int]$nMov.Value
     $script:S.Protect          = $cbLock.Checked
     $script:S.StartWithWindows = $cbRun.Checked
+    $script:S.Translate        = $cbTr.Checked
+    $script:S.ScanWholePC      = $cbPc.Checked
+    if ($cbTr.Checked) { $script:TranslatedExisting = $false }
     $script:S.TelegramToken    = $tbTok.Text.Trim()
     $script:S.TelegramChatId   = $tbChat.Text.Trim()
     Save-Settings
@@ -734,6 +997,7 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('Open Movie Vault', $null, { $form.Show(); $form.WindowState = 'Normal'; $form.Activate() })
 [void]$menu.Items.Add('Open vault folder', $null, { Open-Vault })
 [void]$menu.Items.Add('Scan Downloads now', $null, { Invoke-Scan $true })
+[void]$menu.Items.Add('Scan whole PC now', $null, { Start-PcScan $true })
 [void]$menu.Items.Add('Check for updates', $null, { Invoke-UpdateCheck $true })
 [void]$menu.Items.Add('-')
 [void]$menu.Items.Add('Exit', $null, {
@@ -759,7 +1023,8 @@ $form.Add_FormClosing({
 # ---------------------------------------------------------------- self-update from GitHub
 function Restart-App {
     $script:Exiting = $true
-    try { $timer.Stop(); $updTimer.Stop() } catch {}
+    try { $timer.Stop(); $updTimer.Stop(); $pcTimer.Stop() } catch {}
+    try { if ($script:PcJob) { $script:PcJob.PS.Stop(); $script:PcJob.PS.Dispose() } } catch {}
     $script:tray.Visible = $false
     try { $mutex.ReleaseMutex(); $mutex.Dispose() } catch {}
     Start-Process powershell.exe -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Background' -f $PSCommandPath)
@@ -807,6 +1072,19 @@ $updTimer.Add_Tick({
 })
 $updTimer.Start()
 
+# whole-PC scan: first one a minute after start, then every 6 hours; checks for results every 3s
+$pcTimer = New-Object System.Windows.Forms.Timer
+$pcTimer.Interval = 3000
+$pcTimer.Add_Tick({
+    if ($script:PcJob) {
+        if ($script:PcJob.Handle.IsCompleted) { Complete-PcScan }
+    } elseif ((Get-Date) -ge $script:NextPcScan) {
+        $script:NextPcScan = (Get-Date).AddHours(6)
+        Start-PcScan $false
+    }
+})
+$pcTimer.Start()
+
 # ---------------------------------------------------------------- timer
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 3000      # first scan shortly after start, then every 30s
@@ -826,6 +1104,7 @@ try {
     Write-Log "fatal: $_"
 } finally {
     $timer.Stop()
+    try { $pcTimer.Stop(); if ($script:PcJob) { $script:PcJob.PS.Stop(); $script:PcJob.PS.Dispose() } } catch {}
     $tray.Visible = $false
     $tray.Dispose()
     try { $mutex.ReleaseMutex() } catch {}
