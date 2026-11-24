@@ -32,11 +32,15 @@ $VideoExt   = @('.mkv','.mp4','.avi','.mov','.m4v','.wmv','.webm','.ts','.m2ts',
 $SubExt     = @('.srt','.ass','.ssa','.sub','.idx','.vtt','.smi')
 $PartialExt = @('.crdownload','.part','.partial','.!qb','.!ut','.download','.opdownload','.tmp')
 
+# Names are matched with underscores turned into spaces, and "not after a letter/digit"
+# is used instead of \b so Show_S01E02 and Show.S01E02 both count.
 $TvRx = @(
-    '(?i)^(?<t>.*?)[\s._\-\[\(]*\bs(?<s>\d{1,2})[\s._\-]*e(?<e>\d{1,3})',
-    '(?i)^(?<t>.*?)[\s._\-\[\(]+(?<s>\d{1,2})x(?<e>\d{2,3})\b',
-    '(?i)^(?<t>.*?)[\s._\-\[\(]*\bseason[\s._\-]*(?<s>\d{1,2})',
-    '(?i)^(?<t>.*?)[\s._\-\[\(]*\bs(?<s>\d{1,2})(?=[\s._\-\]\)]|$)'   # season-pack folder, e.g. Show.S02.1080p
+    '(?i)^(?<t>.*?)(?<![a-z0-9])s(?<s>\d{1,2})[\s.\-]*e(?<e>\d{1,3})(?!\d)',          # S01E02, S1.E1, S03 E04
+    '(?i)^(?<t>.*?)(?<![a-z0-9])(?<s>\d{1,2})x(?<e>\d{2,3})(?!\d)',                   # 1x02
+    '(?i)^(?<t>.*?)(?<![a-z0-9])season[\s.\-]*(?<s>\d{1,2})',                          # Season 2
+    '(?i)^(?<t>.*?)(?<![a-z0-9])(?:ep|episode)[\s.\-]*(?<e>\d{1,3})(?!\d)',            # Episode 5 / Ep05
+    '(?i)^(?<t>.*?)(?<![a-z0-9])(?<s>\d{1,2})[\s.\-]*of[\s.\-]*(?<e>\d{1,2})(?!\d)',   # 1of6 (mini-series)
+    '(?i)^(?<t>.*?)(?<![a-z0-9])s(?<s>\d{1,2})(?=[\s.\-\]\)]|$)'                      # season-pack folder, e.g. Show.S02.1080p
 )
 $YearRx = '(?i)^(?<t>.+?)[\s._\-\[\(]+(?<y>19[2-9]\d|20[0-4]\d)(?=[\s._\-\]\)]|$)'
 $TagRx  = '(?i)[\s._\-\[\(](480p|576p|720p|1080p|1080i|2160p|4k|bluray|blu-ray|bdrip|brrip|web-?dl|webrip|hdtv|hdrip|dvdrip|dvdscr|x264|x265|h\.?264|h\.?265|hevc|10bit|yify|yts|rarbg|proper|repack|extended|remastered|imax)(?=[\s._\-\]\)]|$)'
@@ -132,6 +136,88 @@ function Ensure-Library {
     [void][IO.Directory]::CreateDirectory((Join-Path $lib 'Movies'))
     [void][IO.Directory]::CreateDirectory((Join-Path $lib 'TV Shows'))
     if ($isNew -and $script:S.Protect) { Set-Protection $true }
+    Ensure-VaultIcon
+}
+
+# ---------------------------------------------------------------- icon (tray + vault folder)
+function New-IconBitmap([int]$n) {
+    $k = $n / 32.0
+    $bmp = New-Object System.Drawing.Bitmap $n, $n
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.Clear([System.Drawing.Color]::Transparent)
+    $purple = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 124, 58, 237))
+    $g.FillEllipse($purple, [single](1 * $k), [single](1 * $k), [single](30 * $k), [single](30 * $k))
+    $pts = [System.Drawing.PointF[]]@(
+        (New-Object System.Drawing.PointF ([single](12 * $k)), ([single](8 * $k))),
+        (New-Object System.Drawing.PointF ([single](12 * $k)), ([single](24 * $k))),
+        (New-Object System.Drawing.PointF ([single](25 * $k)), ([single](16 * $k))))
+    $g.FillPolygon([System.Drawing.Brushes]::White, $pts)
+    if ($n -ge 64) {
+        # small gold padlock, bottom-right
+        $gold = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 245, 180, 40))
+        $pen  = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 245, 180, 40)), ([single](2 * $k))
+        $g.DrawArc($pen, [single](21.5 * $k), [single](17 * $k), [single](7 * $k), [single](8 * $k), [single]180, [single]180)
+        $g.FillRectangle($gold, [single](20 * $k), [single](21 * $k), [single](10 * $k), [single](9 * $k))
+        $pen.Dispose(); $gold.Dispose()
+    }
+    $g.Dispose(); $purple.Dispose()
+    return $bmp
+}
+
+# Writes a 256px .ico (PNG inside), which Explorer shows sharply at every size.
+function Write-IcoFile([string]$path) {
+    $bmp = New-IconBitmap 256
+    $ms = New-Object IO.MemoryStream
+    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    $png = $ms.ToArray()
+    $fs = [IO.File]::Create($path)
+    $w = New-Object IO.BinaryWriter $fs
+    $w.Write([uint16]0); $w.Write([uint16]1); $w.Write([uint16]1)          # header: 1 image
+    $w.Write([byte]0); $w.Write([byte]0); $w.Write([byte]0); $w.Write([byte]0)   # 256x256, no palette
+    $w.Write([uint16]1); $w.Write([uint16]32)                                # planes, bits
+    $w.Write([uint32]$png.Length); $w.Write([uint32]22)                      # size, offset
+    $w.Write($png)
+    $w.Close()
+}
+
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class MovieVaultShell {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern void SHChangeNotify(int eventId, uint flags, string item1, IntPtr item2);
+    public static void Refresh(string path) {
+        SHChangeNotify(0x00002000, 0x0005, path, IntPtr.Zero);   // SHCNE_UPDATEITEM, SHCNF_PATHW
+        SHChangeNotify(0x08000000, 0, null, IntPtr.Zero);        // SHCNE_ASSOCCHANGED
+    }
+}
+'@
+} catch {}
+
+# Gives the vault folder its own icon (purple play button with a padlock) via desktop.ini.
+function Ensure-VaultIcon {
+    $lib = $script:S.LibraryPath
+    $ico = Join-Path $DataDir 'vault.ico'
+    $ini = Join-Path $lib 'desktop.ini'
+    if ((Test-Path -LiteralPath $ini) -and (Test-Path -LiteralPath $ico)) { return }
+    try {
+        if (-not (Test-Path -LiteralPath $ico)) { Write-IcoFile $ico }
+        if (Test-Path -LiteralPath $ini) { (Get-Item -LiteralPath $ini -Force).Attributes = [IO.FileAttributes]::Normal }
+        Set-Content -LiteralPath $ini -Encoding Unicode -Value @(
+            '[.ShellClassInfo]',
+            "IconResource=$ico,0",
+            '[ViewState]',
+            'FolderType=Videos')
+        (Get-Item -LiteralPath $ini -Force).Attributes = [IO.FileAttributes]'Hidden, System'
+        $d = Get-Item -LiteralPath $lib -Force
+        $d.Attributes = $d.Attributes -bor [IO.FileAttributes]::ReadOnly
+        try { [MovieVaultShell]::Refresh($lib) } catch {}
+    } catch {
+        Write-Log "vault icon: $_"
+    }
 }
 
 # ---------------------------------------------------------------- unprotect mode (used by uninstaller)
@@ -156,12 +242,18 @@ function Clean-Title([string]$t) {
 }
 
 function Match-TV([string]$name, [bool]$allowPack) {
-    $n = 3; if ($allowPack) { $n = 4 }
+    $name = $name -replace '_', ' '
+    $n = $TvRx.Count - 1; if ($allowPack) { $n = $TvRx.Count }
     for ($i = 0; $i -lt $n; $i++) {
         $m = [regex]::Match($name, $TvRx[$i])
         if ($m.Success) { return $m }
     }
     return $null
+}
+
+function Get-Season($m) {
+    if ($m.Groups['s'].Success -and $m.Groups['s'].Value) { return [int]$m.Groups['s'].Value }
+    return 1
 }
 
 function Get-MediaInfo([IO.FileInfo]$f) {
@@ -171,19 +263,19 @@ function Get-MediaInfo([IO.FileInfo]$f) {
     $parentName = ''
     if ($inSub) { $parentName = $f.Directory.Name }
 
-    if (($base -match '(?i)\b(sample|trailer)\b') -and $mb -lt 300) { return $null }
+    if (($base -match '(?i)(?<![a-z0-9])(sample|trailer)(?![a-z0-9])') -and $mb -lt 300) { return $null }
 
     # ---- TV episode?
     $title = ''; $season = 0
     $m = Match-TV $base $false
     if ($m) {
         $title = Clean-Title $m.Groups['t'].Value
-        $season = [int]$m.Groups['s'].Value
+        $season = Get-Season $m
     } elseif ($parentName) {
         $m = Match-TV $parentName $true
         if ($m) {
             $title = Clean-Title $m.Groups['t'].Value
-            $season = [int]$m.Groups['s'].Value
+            $season = Get-Season $m
         }
     }
     if ($m) {
@@ -284,6 +376,62 @@ function Notify($moved) {
 }
 
 # ---------------------------------------------------------------- scan + move
+function Move-Media([IO.FileInfo]$f, $info, [System.Collections.ArrayList]$moved) {
+    if ($info.Kind -eq 'TV') {
+        $dest = Join-Path (Join-Path (Join-Path $script:S.LibraryPath 'TV Shows') $info.Title) ('Season {0:D2}' -f [int]$info.Season)
+        $label = '{0} - Season {1}' -f $info.Title, $info.Season
+    } else {
+        $dest = Join-Path (Join-Path $script:S.LibraryPath 'Movies') $info.Title
+        $label = $info.Title
+    }
+    [void][IO.Directory]::CreateDirectory($dest)
+
+    $srcDir = $f.DirectoryName
+    $base   = [IO.Path]::GetFileNameWithoutExtension($f.Name)
+    $target = Get-FreePath $dest $f.Name
+    [IO.File]::Move($f.FullName, $target)
+
+    # bring matching subtitles along
+    $subs = @(Get-ChildItem -LiteralPath $srcDir -File -ErrorAction SilentlyContinue | Where-Object {
+        ($SubExt -contains $_.Extension.ToLower()) -and $_.Name.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)
+    })
+    foreach ($sub in $subs) {
+        try { [IO.File]::Move($sub.FullName, (Get-FreePath $dest $sub.Name)) } catch { Write-Log "subtitle $($sub.FullName): $_" }
+    }
+
+    [void]$moved.Add([pscustomobject]@{
+        Time  = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+        Kind  = $info.Kind
+        Title = $label
+        File  = $f.Name
+        Path  = $target
+    })
+}
+
+# TV episodes that ended up in Movies (older versions missed some names) get moved to TV Shows.
+function Invoke-Resort([System.Collections.ArrayList]$moved) {
+    $moviesDir = Join-Path $script:S.LibraryPath 'Movies'
+    if (-not [IO.Directory]::Exists($moviesDir)) { return }
+    $vids = @(Get-ChildItem -LiteralPath $moviesDir -File -Recurse -Depth 2 -ErrorAction SilentlyContinue | Where-Object {
+        $VideoExt -contains $_.Extension.ToLower()
+    })
+    foreach ($f in $vids) {
+        try {
+            $info = Get-MediaInfo $f
+            if (-not $info -or $info.Kind -ne 'TV') { continue }
+            $srcDir = $f.DirectoryName
+            Move-Media $f $info $moved
+            # remove the now-empty movie folder (never the Movies folder itself)
+            if (-not ($srcDir.TrimEnd('\') -ieq $moviesDir.TrimEnd('\')) -and
+                @(Get-ChildItem -LiteralPath $srcDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+                [IO.Directory]::Delete($srcDir)
+            }
+        } catch {
+            Write-Log "resort $($f.FullName): $_"
+        }
+    }
+}
+
 $script:Busy = $false
 function Invoke-Scan([bool]$manual = $false) {
     if ($script:Busy) { return }
@@ -305,40 +453,13 @@ function Invoke-Scan([bool]$manual = $false) {
                 $info = Get-MediaInfo $f
                 if (-not $info) { continue }
                 if (-not (Test-Ready $f)) { continue }
-
-                if ($info.Kind -eq 'TV') {
-                    $dest = Join-Path (Join-Path (Join-Path $script:S.LibraryPath 'TV Shows') $info.Title) ('Season {0:D2}' -f [int]$info.Season)
-                    $label = '{0} - Season {1}' -f $info.Title, $info.Season
-                } else {
-                    $dest = Join-Path (Join-Path $script:S.LibraryPath 'Movies') $info.Title
-                    $label = $info.Title
-                }
-                [void][IO.Directory]::CreateDirectory($dest)
-
-                $srcDir = $f.DirectoryName
-                $base   = [IO.Path]::GetFileNameWithoutExtension($f.Name)
-                $target = Get-FreePath $dest $f.Name
-                [IO.File]::Move($f.FullName, $target)
-
-                # bring matching subtitles along
-                $subs = @(Get-ChildItem -LiteralPath $srcDir -File -ErrorAction SilentlyContinue | Where-Object {
-                    ($SubExt -contains $_.Extension.ToLower()) -and $_.Name.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)
-                })
-                foreach ($sub in $subs) {
-                    try { [IO.File]::Move($sub.FullName, (Get-FreePath $dest $sub.Name)) } catch { Write-Log "subtitle $($sub.FullName): $_" }
-                }
-
-                [void]$moved.Add([pscustomobject]@{
-                    Time  = (Get-Date).ToString('yyyy-MM-dd HH:mm')
-                    Kind  = $info.Kind
-                    Title = $label
-                    File  = $f.Name
-                    Path  = $target
-                })
+                Move-Media $f $info $moved
             } catch {
                 Write-Log "move $($f.FullName): $_"
             }
         }
+
+        Invoke-Resort $moved
     } catch {
         Write-Log "scan: $_"
     } finally {
@@ -366,18 +487,7 @@ try { Ensure-Library; if ($script:S.Protect) { Set-Protection $true } } catch { 
 
 # ---------------------------------------------------------------- icon
 function New-AppIcon {
-    $bmp = New-Object System.Drawing.Bitmap 32, 32
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.Clear([System.Drawing.Color]::Transparent)
-    $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 124, 58, 237))
-    $g.FillEllipse($brush, 1, 1, 30, 30)
-    $pts = [System.Drawing.Point[]]@(
-        (New-Object System.Drawing.Point 12, 8),
-        (New-Object System.Drawing.Point 12, 24),
-        (New-Object System.Drawing.Point 25, 16))
-    $g.FillPolygon([System.Drawing.Brushes]::White, $pts)
-    $g.Dispose(); $brush.Dispose()
+    $bmp = New-IconBitmap 32
     return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 }
 $icon = New-AppIcon

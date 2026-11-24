@@ -11,7 +11,10 @@ Watches your **Downloads** folder and moves every movie and TV episode into one 
 ## How it sorts
 - `Show.Name.S02E05.1080p.mkv` → `Movies & TV\TV Shows\Show Name\Season 02\`
 - `Movie.Title.2023.1080p.WEB-DL.mkv` → `Movies & TV\Movies\Movie Title (2023)\`
+- Also recognises `Show_S01E02`, `S1.E1`, `S03 E04`, `1x02`, `Season 2`, `Episode 5` and `1of6`.
+- TV episodes that ended up in Movies are moved to TV Shows automatically.
 - Matching subtitles (.srt etc.) move with the video.
+- The vault folder gets its own icon (purple play button with a padlock).
 - It waits until a download is finished (not changing, not open in your browser/torrent app).
 - Small clips are ignored: episodes under 40 MB and movies under 300 MB stay put (change in Settings).
   A video also needs a movie/TV-style name (year, SxxEyy, 1080p, WEB-DL…), so your own clips stay in Downloads.
