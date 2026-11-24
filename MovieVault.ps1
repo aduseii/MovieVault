@@ -21,6 +21,8 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $App          = 'Movie Vault'
+$Version      = '1.2.0'      # bump this on every change pushed to GitHub - installed copies update themselves
+$UpdateUrl    = 'https://raw.githubusercontent.com/aduseii/MovieVault/main/MovieVault.ps1'
 $DataDir      = Join-Path $env:APPDATA 'MovieVault'
 if (-not (Test-Path -LiteralPath $DataDir)) { [void][IO.Directory]::CreateDirectory($DataDir) }
 $SettingsFile = Join-Path $DataDir 'settings.json'
@@ -475,9 +477,10 @@ function Invoke-Scan([bool]$manual = $false) {
 }
 
 # ---------------------------------------------------------------- single instance
-$created = $false
-$mutex = New-Object System.Threading.Mutex($true, 'Local\MovieVaultApp', [ref]$created)
-if (-not $created) {
+$mutex = New-Object System.Threading.Mutex($false, 'Local\MovieVaultApp')
+$gotLock = $false
+try { $gotLock = $mutex.WaitOne(5000) } catch [System.Threading.AbandonedMutexException] { $gotLock = $true }
+if (-not $gotLock) {
     [void][System.Windows.Forms.MessageBox]::Show('Movie Vault is already running. Look for it in the tray (bottom-right).', $App)
     exit 0
 }
@@ -494,7 +497,7 @@ $icon = New-AppIcon
 
 # ---------------------------------------------------------------- main window
 $form = New-Object System.Windows.Forms.Form
-$form.Text = $App
+$form.Text = "$App  v$Version"
 $form.Icon = $icon
 $form.StartPosition = 'CenterScreen'
 $form.Size = New-Object System.Drawing.Size(820, 500)
@@ -523,6 +526,7 @@ function New-Button([string]$text) {
 $btnOpen     = New-Button 'Open vault folder'
 $btnScan     = New-Button 'Scan Downloads now'
 $btnSettings = New-Button 'Settings'
+$btnUpdate   = New-Button 'Check for updates'
 $top.Controls.Add($buttons)
 
 $script:list = New-Object System.Windows.Forms.ListView
@@ -730,6 +734,7 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('Open Movie Vault', $null, { $form.Show(); $form.WindowState = 'Normal'; $form.Activate() })
 [void]$menu.Items.Add('Open vault folder', $null, { Open-Vault })
 [void]$menu.Items.Add('Scan Downloads now', $null, { Invoke-Scan $true })
+[void]$menu.Items.Add('Check for updates', $null, { Invoke-UpdateCheck $true })
 [void]$menu.Items.Add('-')
 [void]$menu.Items.Add('Exit', $null, {
     $script:Exiting = $true
@@ -750,6 +755,57 @@ $form.Add_FormClosing({
         $script:tray.ShowBalloonTip(2500, $App, 'Still watching your Downloads from the tray.', [System.Windows.Forms.ToolTipIcon]::Info)
     }
 })
+
+# ---------------------------------------------------------------- self-update from GitHub
+function Restart-App {
+    $script:Exiting = $true
+    try { $timer.Stop(); $updTimer.Stop() } catch {}
+    $script:tray.Visible = $false
+    try { $mutex.ReleaseMutex(); $mutex.Dispose() } catch {}
+    Start-Process powershell.exe -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Background' -f $PSCommandPath)
+    $form.Close()
+    [System.Windows.Forms.Application]::Exit()
+}
+
+function Invoke-UpdateCheck([bool]$manual = $false) {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $r = Invoke-WebRequest -Uri ('{0}?t={1}' -f $UpdateUrl, [DateTime]::UtcNow.Ticks) -UseBasicParsing -TimeoutSec 20
+        $code = [string]$r.Content
+        $m = [regex]::Match($code, "(?m)^\`$Version\s*=\s*'(?<v>[\d.]+)'")
+        if (-not $m.Success) { throw 'No version found in the GitHub copy.' }
+        $remote = [version]$m.Groups['v'].Value
+        if ($remote -le [version]$Version) {
+            if ($manual) { $script:tray.ShowBalloonTip(3000, $App, "You have the latest version (v$Version).", [System.Windows.Forms.ToolTipIcon]::Info) }
+            return
+        }
+        # only install a copy that is really Movie Vault and parses cleanly
+        $errs = $null
+        [void][System.Management.Automation.PSParser]::Tokenize($code, [ref]$errs)
+        if ($errs.Count -gt 0 -or $code -notmatch "\`$App\s*=\s*'Movie Vault'") { throw 'The GitHub copy looks broken, skipped it.' }
+
+        $tmp = "$PSCommandPath.new"
+        [IO.File]::WriteAllText($tmp, $code, (New-Object Text.UTF8Encoding $true))
+        Copy-Item -LiteralPath $PSCommandPath -Destination "$PSCommandPath.old" -Force
+        Move-Item -LiteralPath $tmp -Destination $PSCommandPath -Force
+        Write-Log "updated $Version -> $remote"
+        $script:tray.ShowBalloonTip(3000, $App, "Updated to v$remote. Restarting...", [System.Windows.Forms.ToolTipIcon]::Info)
+        Start-Sleep -Seconds 2
+        Restart-App
+    } catch {
+        Write-Log "update: $_"
+        if ($manual) { [void][System.Windows.Forms.MessageBox]::Show("Couldn't check for updates.`n`n$_", $App) }
+    }
+}
+$btnUpdate.Add_Click({ Invoke-UpdateCheck $true })
+
+$updTimer = New-Object System.Windows.Forms.Timer
+$updTimer.Interval = 15000          # first check 15s after start, then every 3 hours
+$updTimer.Add_Tick({
+    $updTimer.Interval = 3 * 60 * 60 * 1000
+    Invoke-UpdateCheck $false
+})
+$updTimer.Start()
 
 # ---------------------------------------------------------------- timer
 $timer = New-Object System.Windows.Forms.Timer

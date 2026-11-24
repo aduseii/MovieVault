@@ -19,6 +19,11 @@ Watches your **Downloads** folder and moves every movie and TV episode into one 
 - Small clips are ignored: episodes under 40 MB and movies under 300 MB stay put (change in Settings).
   A video also needs a movie/TV-style name (year, SxxEyy, 1080p, WEB-DL…), so your own clips stay in Downloads.
 
+## Updates
+Movie Vault updates itself from this GitHub repo: it checks 15 seconds after starting and then
+every 3 hours, installs the new version and restarts. **Check for updates** (window or tray menu)
+checks right away. To ship an update, push a new `MovieVault.ps1` with a higher `$Version`.
+
 ## The lock
 - `Movies & TV`, and the `Movies` and `TV Shows` folders inside it, **can't be deleted, renamed
   or moved** from outside. Ctrl+A → Delete in Downloads deletes everything else and Windows
