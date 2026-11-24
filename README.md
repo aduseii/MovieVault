@@ -31,6 +31,14 @@ outside Downloads. Those files stay where they are; a **shortcut** to each one i
 everything shows up in one place. Windows, Program Files, AppData and game folders (Steam, Epic, Xbox, Riot)
 are skipped. If you delete the original file, its shortcut is removed from the vault. Turn it off in Settings.
 
+## Never touched
+Movie Vault never moves or links videos from editing apps, YouTube downloaders or recordings:
+- any folder named like Filmora / Wondershare, 4K Video Downloader, YouTube, yt-dlp, CapCut, Clipchamp,
+  OBS, Captures, Screen Recordings, NVIDIA (ShadowPlay), Reel Maker, Crave Clips or Mora, anywhere on the PC
+- files saved from YouTube download sites (y2mate, savefrom, ssyoutube, yt1s, snapsave…) or with a
+  yt-dlp `[videoID]` at the end of the name
+- any folder you add under **Settings → Never touch these folders**
+
 ## Weekly clean-up reminder
 Once a week Movie Vault pops up a reminder (and sends it to Telegram if that's set up) showing how many
 movies and episodes are in the vault, how much space they use, and the biggest files. Choose **Open vault**,

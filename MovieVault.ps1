@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $App          = 'Movie Vault'
-$Version      = '1.4.0'      # bump this on every change pushed to GitHub - installed copies update themselves
+$Version      = '1.5.0'      # bump this on every change pushed to GitHub - installed copies update themselves
 $UpdateUrl    = 'https://raw.githubusercontent.com/aduseii/MovieVault/main/MovieVault.ps1'
 $DataDir      = Join-Path $env:APPDATA 'MovieVault'
 if (-not (Test-Path -LiteralPath $DataDir)) { [void][IO.Directory]::CreateDirectory($DataDir) }
@@ -66,6 +66,8 @@ function Get-DownloadsPath {
 
 function Load-Settings {
     $dl = Get-DownloadsPath
+    $vids = [Environment]::GetFolderPath('MyVideos')
+    if (-not $vids) { $vids = Join-Path $env:USERPROFILE 'Videos' }
     $s = [ordered]@{
         DownloadsPath    = $dl
         LibraryPath      = (Join-Path $dl 'Movies & TV')
@@ -80,6 +82,10 @@ function Load-Settings {
         ScanWholePC      = $true
         WeeklyReminder   = $true
         NextReminder     = ''
+        ExcludeFolders   = @(
+            (Join-Path $vids '4K Video Downloader+'), (Join-Path $vids 'Mora'), (Join-Path $vids 'Crave Clips'),
+            (Join-Path $vids 'Reel Maker'), (Join-Path $vids 'Captures'), (Join-Path $vids 'Screen Recordings'),
+            (Join-Path $vids 'NVIDIA'))
     }
     if (Test-Path -LiteralPath $SettingsFile) {
         try {
@@ -245,6 +251,23 @@ function Clean-Title([string]$t) {
     $t = $t.TrimEnd('.', ' ')
     if ($t -and ($t -ceq $t.ToLower())) { $t = (Get-Culture).TextInfo.ToTitleCase($t) }
     return $t
+}
+
+# ---- never touched: editing apps, YouTube downloaders, recordings, your own clips
+# Any folder with one of these names, anywhere on the PC:
+$ExcludeNameRx = '(?i)^(.*filmora.*|wondershare.*|4k video downloader.*|.*youtube.*|yt-dlp|youtube-dl|ytdl.*|clipchamp|capcut.*|obs|captures|screen recordings|nvidia|shadowplay|reel maker|crave clips|mora)$'
+# Files saved from YouTube download sites, or yt-dlp's "Title [videoID]" names:
+$ExcludeFileRx = '(?i)(y2mate|savefrom|ssyoutube|yt1s|yt5s|snapsave|ytmp4|9convert|loader\.to|cobalt|youtube|\[[A-Za-z0-9_-]{11}\]$)'
+
+function Test-Excluded([string]$path) {
+    if (-not $path) { return $false }
+    $parts = $path.Split('\')
+    for ($i = 0; $i -lt $parts.Count - 1; $i++) { if ($parts[$i] -match $ExcludeNameRx) { return $true } }
+    if ([IO.Path]::GetFileNameWithoutExtension($path) -match $ExcludeFileRx) { return $true }
+    foreach ($x in @($script:S.ExcludeFolders)) {
+        if ($x -and $path.StartsWith(([string]$x).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
 }
 
 function Match-TV([string]$name, [bool]$allowPack) {
@@ -575,7 +598,7 @@ function Invoke-Resort([System.Collections.ArrayList]$moved) {
 # ---------------------------------------------------------------- whole-PC scan -> shortcuts in the vault
 # Movies/shows found anywhere else on the PC stay where they are; a shortcut to each is put in the vault.
 $PcScanScript = {
-    param($roots, $skipPaths, $minBytes, $exts)
+    param($roots, $skipPaths, $minBytes, $exts, $skipNameRx)
     $skipNames = @('windows', 'program files', 'program files (x86)', 'programdata', 'appdata', '$recycle.bin',
         'system volume information', 'recovery', 'perflogs', 'node_modules', 'steamapps', 'steamlibrary',
         'epic games', 'xboxgames', 'riot games', 'windowsapps', '.git', 'msocache', 'config.msi',
@@ -595,6 +618,7 @@ $PcScanScript = {
                     $di = New-Object IO.DirectoryInfo $sub
                     if ($di.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
                     if ($skipNames -contains $di.Name.ToLowerInvariant()) { continue }
+                    if ($di.Name -match $skipNameRx) { continue }
                     $full = $di.FullName.TrimEnd('\') + '\'
                     $skip = $false
                     foreach ($sp in $skipPaths) { if ($full.StartsWith([string]$sp, [StringComparison]::OrdinalIgnoreCase)) { $skip = $true; break } }
@@ -619,10 +643,11 @@ function Start-PcScan([bool]$manual = $false) {
     $skip = @(
         ([IO.Path]::GetFullPath($script:S.LibraryPath).TrimEnd('\') + '\'),
         ($script:S.DownloadsPath.TrimEnd('\') + '\'))
+    foreach ($x in @($script:S.ExcludeFolders)) { if ($x) { $skip += ([string]$x).TrimEnd('\') + '\' } }
     $min = [long][Math]::Min([int]$script:S.MinEpisodeMB, [int]$script:S.MinMovieMB) * 1MB
     $ps = [powershell]::Create()
     [void]$ps.AddScript($PcScanScript.ToString())
-    [void]$ps.AddArgument($roots).AddArgument($skip).AddArgument($min).AddArgument($VideoExt)
+    [void]$ps.AddArgument($roots).AddArgument($skip).AddArgument($min).AddArgument($VideoExt).AddArgument($ExcludeNameRx)
     $script:PcJob = [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Manual = $manual }
     if ($manual) { $script:tray.ShowBalloonTip(3000, $App, 'Scanning the whole PC in the background...', [System.Windows.Forms.ToolTipIcon]::Info) }
 }
@@ -644,7 +669,8 @@ function Remove-StaleShortcuts {
             $t = [string]$script:Wsh.CreateShortcut($l.FullName).TargetPath
             if (-not $t -or ($VideoExt -notcontains [IO.Path]::GetExtension($t).ToLower())) { continue }
             $root = [IO.Path]::GetPathRoot($t)
-            if ($root -and (Test-Path -LiteralPath $root) -and -not (Test-Path -LiteralPath $t)) {
+            $gone = $root -and (Test-Path -LiteralPath $root) -and -not (Test-Path -LiteralPath $t)
+            if ($gone -or (Test-Excluded $t)) {     # also removes any shortcut to an excluded folder
                 Remove-Item -LiteralPath $l.FullName -Force
                 Remove-EmptyUpTo $l.DirectoryName
             }
@@ -662,7 +688,7 @@ function Complete-PcScan {
         foreach ($p in $paths) {
             try {
                 $f = New-Object IO.FileInfo $p
-                if (-not $f.Exists) { continue }
+                if (-not $f.Exists -or (Test-Excluded $f.FullName)) { continue }
                 $info = Get-MediaInfo $f
                 if (-not $info) { continue }
                 $df = Get-DestFolder $info
@@ -704,7 +730,8 @@ function Invoke-Scan([bool]$manual = $false) {
 
         $files = @(Get-ChildItem -LiteralPath $dl -File -Recurse -Depth 3 -ErrorAction SilentlyContinue | Where-Object {
             ($VideoExt -contains $_.Extension.ToLower()) -and
-            -not $_.FullName.StartsWith($libPrefix, [StringComparison]::OrdinalIgnoreCase)
+            -not $_.FullName.StartsWith($libPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+            -not (Test-Excluded $_.FullName)
         })
 
         foreach ($f in $files) {
@@ -907,6 +934,23 @@ function Show-Settings {
     $cbTr   = Add-Check 'Use English names for shows and movies in other languages' ([bool]$script:S.Translate)
     $cbPc   = Add-Check 'Find movies and shows on the rest of the PC (adds shortcuts to the vault)' ([bool]$script:S.ScanWholePC)
     $cbRem  = Add-Check 'Remind me to clean up the vault every week' ([bool]$script:S.WeeklyReminder)
+
+    Add-Label "Never touch these folders`n(one per line)"
+    $tbEx = New-Object System.Windows.Forms.TextBox
+    $tbEx.Multiline = $true; $tbEx.ScrollBars = 'Vertical'; $tbEx.WordWrap = $false
+    $tbEx.Width = 380; $tbEx.Height = 110
+    $tbEx.Text = (@($script:S.ExcludeFolders) | Where-Object { $_ }) -join "`r`n"
+    $t.Controls.Add($tbEx)
+    $bAddEx = New-Object System.Windows.Forms.Button
+    $bAddEx.Text = 'Add folder...'; $bAddEx.AutoSize = $true; $bAddEx.Anchor = 'Top'
+    $bAddEx.Add_Click({
+        $d = New-Object System.Windows.Forms.FolderBrowserDialog
+        if ($d.ShowDialog() -eq 'OK') {
+            if ($tbEx.Text -and -not $tbEx.Text.EndsWith("`n")) { $tbEx.AppendText("`r`n") }
+            $tbEx.AppendText($d.SelectedPath)
+        }
+    })
+    $t.Controls.Add($bAddEx)
     $tbTok  = Add-Text 'Telegram bot token (optional)' ([string]$script:S.TelegramToken)
     $tbChat = Add-Text 'Telegram chat ID' ([string]$script:S.TelegramChatId)
 
@@ -966,6 +1010,7 @@ function Show-Settings {
     $script:S.Translate        = $cbTr.Checked
     $script:S.ScanWholePC      = $cbPc.Checked
     $script:S.WeeklyReminder   = $cbRem.Checked
+    $script:S.ExcludeFolders   = @($tbEx.Text -split "`r?`n" | ForEach-Object { $_.Trim().TrimEnd('\') } | Where-Object { $_ })
     if ($cbTr.Checked) { $script:TranslatedExisting = $false }
     $script:S.TelegramToken    = $tbTok.Text.Trim()
     $script:S.TelegramChatId   = $tbChat.Text.Trim()
