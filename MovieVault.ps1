@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $App          = 'Movie Vault'
-$Version      = '1.3.0'      # bump this on every change pushed to GitHub - installed copies update themselves
+$Version      = '1.4.0'      # bump this on every change pushed to GitHub - installed copies update themselves
 $UpdateUrl    = 'https://raw.githubusercontent.com/aduseii/MovieVault/main/MovieVault.ps1'
 $DataDir      = Join-Path $env:APPDATA 'MovieVault'
 if (-not (Test-Path -LiteralPath $DataDir)) { [void][IO.Directory]::CreateDirectory($DataDir) }
@@ -78,6 +78,8 @@ function Load-Settings {
         ProtectedParent  = ''
         Translate        = $true
         ScanWholePC      = $true
+        WeeklyReminder   = $true
+        NextReminder     = ''
     }
     if (Test-Path -LiteralPath $SettingsFile) {
         try {
@@ -904,6 +906,7 @@ function Show-Settings {
     $cbRun  = Add-Check 'Start Movie Vault when Windows starts' ([bool]$script:S.StartWithWindows)
     $cbTr   = Add-Check 'Use English names for shows and movies in other languages' ([bool]$script:S.Translate)
     $cbPc   = Add-Check 'Find movies and shows on the rest of the PC (adds shortcuts to the vault)' ([bool]$script:S.ScanWholePC)
+    $cbRem  = Add-Check 'Remind me to clean up the vault every week' ([bool]$script:S.WeeklyReminder)
     $tbTok  = Add-Text 'Telegram bot token (optional)' ([string]$script:S.TelegramToken)
     $tbChat = Add-Text 'Telegram chat ID' ([string]$script:S.TelegramChatId)
 
@@ -962,6 +965,7 @@ function Show-Settings {
     $script:S.StartWithWindows = $cbRun.Checked
     $script:S.Translate        = $cbTr.Checked
     $script:S.ScanWholePC      = $cbPc.Checked
+    $script:S.WeeklyReminder   = $cbRem.Checked
     if ($cbTr.Checked) { $script:TranslatedExisting = $false }
     $script:S.TelegramToken    = $tbTok.Text.Trim()
     $script:S.TelegramChatId   = $tbChat.Text.Trim()
@@ -998,6 +1002,7 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('Open vault folder', $null, { Open-Vault })
 [void]$menu.Items.Add('Scan Downloads now', $null, { Invoke-Scan $true })
 [void]$menu.Items.Add('Scan whole PC now', $null, { Start-PcScan $true })
+[void]$menu.Items.Add('Show clean-up reminder now', $null, { try { Show-CleanupReminder } catch { Write-Log "reminder: $_" } })
 [void]$menu.Items.Add('Check for updates', $null, { Invoke-UpdateCheck $true })
 [void]$menu.Items.Add('-')
 [void]$menu.Items.Add('Exit', $null, {
@@ -1023,7 +1028,7 @@ $form.Add_FormClosing({
 # ---------------------------------------------------------------- self-update from GitHub
 function Restart-App {
     $script:Exiting = $true
-    try { $timer.Stop(); $updTimer.Stop(); $pcTimer.Stop() } catch {}
+    try { $timer.Stop(); $updTimer.Stop(); $pcTimer.Stop(); $remTimer.Stop() } catch {}
     try { if ($script:PcJob) { $script:PcJob.PS.Stop(); $script:PcJob.PS.Dispose() } } catch {}
     $script:tray.Visible = $false
     try { $mutex.ReleaseMutex(); $mutex.Dispose() } catch {}
@@ -1071,6 +1076,88 @@ $updTimer.Add_Tick({
     Invoke-UpdateCheck $false
 })
 $updTimer.Start()
+
+# ---------------------------------------------------------------- weekly clean-up reminder
+# Fires 7 days after the last one. If the PC was off at that moment, it fires the next time the app runs.
+function Get-ReminderDue {
+    $due = [DateTime]::MinValue
+    if (-not [DateTime]::TryParse([string]$script:S.NextReminder, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$due)) {
+        $due = (Get-Date).AddDays(7)
+        $script:S.NextReminder = $due.ToString('o')
+        Save-Settings
+    }
+    return $due
+}
+
+function Set-NextReminder([double]$days) {
+    $script:S.NextReminder = (Get-Date).AddDays($days).ToString('o')
+    Save-Settings
+}
+
+function Format-Size([double]$bytes) {
+    if ($bytes -ge 1GB) { return '{0:N1} GB' -f ($bytes / 1GB) }
+    return '{0:N0} MB' -f ($bytes / 1MB)
+}
+
+function Show-CleanupReminder {
+    Set-NextReminder 7
+    $lib = $script:S.LibraryPath
+    $vids = @(Get-ChildItem -LiteralPath $lib -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $VideoExt -contains $_.Extension.ToLower() })
+    $links = @(Get-ChildItem -LiteralPath $lib -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue)
+    $total = ($vids | Measure-Object -Property Length -Sum).Sum
+    if (-not $total) { $total = 0 }
+    $eps = @($vids | Where-Object { $_.FullName -like '*\TV Shows\*' }).Count
+    $movies = $vids.Count - $eps
+    $biggest = @($vids | Sort-Object Length -Descending | Select-Object -First 5)
+
+    $summary = "Your vault has $movies movie(s) and $eps episode(s), using $(Format-Size $total)."
+    if ($links.Count) { $summary += " Plus $($links.Count) shortcut(s) to files elsewhere on your PC." }
+    $big = @($biggest | ForEach-Object { '- {0}  ({1})' -f [IO.Path]::GetFileNameWithoutExtension($_.Name), (Format-Size $_.Length) })
+
+    $broom = [char]::ConvertFromUtf32(0x1F9F9)
+    $tg = "$broom Movie Vault weekly clean-up`n$summary"
+    if ($big.Count) { $tg += "`n`nBiggest files:`n" + ($big -join "`n") }
+    $tg += "`n`nDelete what you've watched from inside the Movies & TV folder."
+    Send-Telegram $tg
+
+    # pop-up window on the PC (stays until you pick something)
+    $w = New-Object System.Windows.Forms.Form
+    $w.Text = "$App - weekly clean-up"; $w.Icon = $icon; $w.TopMost = $true
+    $w.FormBorderStyle = 'FixedDialog'; $w.MaximizeBox = $false; $w.MinimizeBox = $false
+    $w.StartPosition = 'CenterScreen'; $w.AutoSize = $true; $w.AutoSizeMode = 'GrowAndShrink'
+    $w.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+    $w.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $p = New-Object System.Windows.Forms.FlowLayoutPanel
+    $p.FlowDirection = 'TopDown'; $p.AutoSize = $true; $p.Padding = New-Object System.Windows.Forms.Padding(14)
+    $w.Controls.Add($p)
+    $l = New-Object System.Windows.Forms.Label
+    $l.AutoSize = $true; $l.MaximumSize = New-Object System.Drawing.Size(460, 0)
+    $l.Text = "Time to clean up!`n`n$summary"
+    if ($big.Count) { $l.Text += "`n`nBiggest files:`n" + ($big -join "`n") }
+    $p.Controls.Add($l)
+    $row = New-Object System.Windows.Forms.FlowLayoutPanel
+    $row.AutoSize = $true; $row.Margin = New-Object System.Windows.Forms.Padding(0, 12, 0, 0)
+    $bOpen = New-Object System.Windows.Forms.Button; $bOpen.Text = 'Open vault'; $bOpen.AutoSize = $true
+    $bLater = New-Object System.Windows.Forms.Button; $bLater.Text = 'Remind me tomorrow'; $bLater.AutoSize = $true
+    $bDone = New-Object System.Windows.Forms.Button; $bDone.Text = 'Done for this week'; $bDone.AutoSize = $true
+    $row.Controls.Add($bOpen); $row.Controls.Add($bLater); $row.Controls.Add($bDone)
+    $p.Controls.Add($row)
+    $bOpen.Add_Click({ Open-Vault; $this.FindForm().Close() })
+    $bLater.Add_Click({ Set-NextReminder 1; $this.FindForm().Close() })
+    $bDone.Add_Click({ $this.FindForm().Close() })
+    $w.Show()
+    $w.Activate()
+}
+
+$remTimer = New-Object System.Windows.Forms.Timer
+$remTimer.Interval = 60000          # checks once a minute
+$remTimer.Add_Tick({
+    if ($script:S.WeeklyReminder -and (Get-Date) -ge (Get-ReminderDue)) {
+        try { Show-CleanupReminder } catch { Write-Log "reminder: $_" }
+    }
+})
+[void](Get-ReminderDue)             # first reminder 7 days after installing
+$remTimer.Start()
 
 # whole-PC scan: first one a minute after start, then every 6 hours; checks for results every 3s
 $pcTimer = New-Object System.Windows.Forms.Timer

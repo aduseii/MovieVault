@@ -31,6 +31,12 @@ outside Downloads. Those files stay where they are; a **shortcut** to each one i
 everything shows up in one place. Windows, Program Files, AppData and game folders (Steam, Epic, Xbox, Riot)
 are skipped. If you delete the original file, its shortcut is removed from the vault. Turn it off in Settings.
 
+## Weekly clean-up reminder
+Once a week Movie Vault pops up a reminder (and sends it to Telegram if that's set up) showing how many
+movies and episodes are in the vault, how much space they use, and the biggest files. Choose **Open vault**,
+**Remind me tomorrow** or **Done for this week**. If the PC was off when it was due, it shows the next time
+Movie Vault starts. Tray menu → **Show clean-up reminder now** shows it right away. Turn it off in Settings.
+
 ## Updates
 Movie Vault updates itself from this GitHub repo: it checks 15 seconds after starting and then
 every 3 hours, installs the new version and restarts. **Check for updates** (window or tray menu)
