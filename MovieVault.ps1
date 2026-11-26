@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $App          = 'Movie Vault'
-$Version      = '1.5.0'      # bump this on every change pushed to GitHub - installed copies update themselves
+$Version      = '1.5.1'      # bump this on every change pushed to GitHub - installed copies update themselves
 $UpdateUrl    = 'https://raw.githubusercontent.com/aduseii/MovieVault/main/MovieVault.ps1'
 $DataDir      = Join-Path $env:APPDATA 'MovieVault'
 if (-not (Test-Path -LiteralPath $DataDir)) { [void][IO.Directory]::CreateDirectory($DataDir) }
@@ -1025,16 +1025,58 @@ function Show-Settings {
 }
 $btnSettings.Add_Click({ Show-Settings })
 
+# Windows always flashes a console for powershell.exe, even with -WindowStyle Hidden.
+# So everything (Windows startup, Start menu, restarts after updates) goes through a tiny
+# VBScript launcher run by wscript.exe, which starts PowerShell with no window at all.
+$LauncherPath = Join-Path (Split-Path -Parent $PSCommandPath) 'MovieVault.vbs'
+function Ensure-Launcher {
+    $vbs = @'
+' Movie Vault silent launcher - starts MovieVault.ps1 with no console window.
+Set sh = CreateObject("WScript.Shell")
+dir = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
+args = ""
+For Each a In WScript.Arguments
+    args = args & " " & a
+Next
+sh.Run "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & dir & "\MovieVault.ps1""" & args, 0, False
+'@
+    $vbs = $vbs -replace "`r?`n", "`r`n"
+    try {
+        $cur = if (Test-Path -LiteralPath $LauncherPath) { [IO.File]::ReadAllText($LauncherPath) } else { '' }
+        if ($cur -ne $vbs) { [IO.File]::WriteAllText($LauncherPath, $vbs, [Text.Encoding]::ASCII) }
+    } catch { Write-Log "launcher: $_" }
+    # point the Start menu shortcut at the silent launcher too
+    try {
+        $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Movie Vault.lnk'
+        if (Test-Path -LiteralPath $lnk) {
+            $sh = New-Object -ComObject WScript.Shell
+            $s = $sh.CreateShortcut($lnk)
+            if ($s.TargetPath -notlike '*wscript.exe') {
+                $s.TargetPath = Join-Path $env:WINDIR 'System32\wscript.exe'
+                $s.Arguments = '"{0}"' -f $LauncherPath
+                $s.WorkingDirectory = Split-Path -Parent $PSCommandPath
+                $ico = Join-Path (Split-Path -Parent $PSCommandPath) 'MovieVault.ico'
+                try { $fs = [IO.File]::Create($ico); $icon.Save($fs); $fs.Close(); $s.IconLocation = $ico } catch {}
+                $s.Save()
+            }
+        }
+    } catch { Write-Log "shortcut: $_" }
+}
+
 function Set-Startup([bool]$on) {
     try {
         if ($on) {
-            $cmd = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Background' -f $PSCommandPath
+            $cmd = '"{0}" "{1}" -Background' -f (Join-Path $env:WINDIR 'System32\wscript.exe'), $LauncherPath
             Set-ItemProperty -Path $RunKey -Name 'MovieVault' -Value $cmd
         } else {
             Remove-ItemProperty -Path $RunKey -Name 'MovieVault' -ErrorAction SilentlyContinue
         }
     } catch { Write-Log "startup: $_" }
 }
+
+# move older installs (which started powershell.exe directly) over to the silent launcher
+Ensure-Launcher
+if ($script:S.StartWithWindows) { Set-Startup $true }
 
 # ---------------------------------------------------------------- tray
 $script:tray = New-Object System.Windows.Forms.NotifyIcon
@@ -1077,7 +1119,8 @@ function Restart-App {
     try { if ($script:PcJob) { $script:PcJob.PS.Stop(); $script:PcJob.PS.Dispose() } } catch {}
     $script:tray.Visible = $false
     try { $mutex.ReleaseMutex(); $mutex.Dispose() } catch {}
-    Start-Process powershell.exe -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Background' -f $PSCommandPath)
+    Ensure-Launcher
+    Start-Process (Join-Path $env:WINDIR 'System32\wscript.exe') -ArgumentList ('"{0}" -Background' -f $LauncherPath)
     $form.Close()
     [System.Windows.Forms.Application]::Exit()
 }

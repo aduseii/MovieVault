@@ -6,7 +6,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Pr
 powershell -NoProfile -ExecutionPolicy Bypass -File "%DEST%\MovieVault.ps1" -Unprotect
 reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v MovieVault /f >nul 2>&1
 powershell -NoProfile -Command "Remove-Item -LiteralPath ([Environment]::GetFolderPath('Programs')+'\Movie Vault.lnk') -ErrorAction SilentlyContinue"
-del /q "%DEST%\MovieVault.ps1" >nul 2>&1
+del /q "%DEST%\MovieVault.ps1" "%DEST%\MovieVault.vbs" "%DEST%\MovieVault.ico" "%DEST%\MovieVault.ps1.old" >nul 2>&1
 echo Done.
 pause
 (goto) 2>nul & del /q "%DEST%\Uninstall.bat"
